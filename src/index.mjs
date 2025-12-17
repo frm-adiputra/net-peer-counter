@@ -172,5 +172,5 @@ const preferredCountries = [
   "Sudan",
 ];
 
-// await fetchPeers(asNumbers);
-await analyze(asNumbers, preferredCountries);
+await fetchPeers(asNumbers);
+// await analyze(asNumbers, preferredCountries);
