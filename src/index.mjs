@@ -4,27 +4,40 @@ import { DuckDBConnection } from "@duckdb/node-api";
 import { parse } from "node-html-parser";
 
 const userDataDir = "./.userData";
+const targetDir = "data";
 
-async function main(asNumber) {
+async function fetchPeers(asNumbers) {
   // Setup
+  await fs.promises.mkdir(targetDir, { recursive: true });
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: true,
   });
-  const page = await context.newPage();
 
-  const { isp, peers } = await getPeers(page, asNumber);
-  console.log(isp);
+  const proms = [];
+  for (const asNumber of asNumbers) {
+    const page = await context.newPage();
+    proms.push(getPeers(page, asNumber));
+  }
 
-  await fs.promises.mkdir("data", { recursive: true });
-  await fs.promises.writeFile(
-    peersFile(asNumber),
-    JSON.stringify(peers, null, 2),
-  );
-  await analyze(asNumber);
+  const isps = await Promise.all(proms);
+
+  await fs.promises.writeFile(ispFile(), JSON.stringify(isps, null, 2));
+
+  // await doAnalyze(asNumber);
 
   // Teardown
   // await page.pause();
   await context.close();
+}
+
+async function analyze(asNumbers, preferredCountries) {
+  const conn = await DuckDBConnection.create();
+  const proms = [];
+  for (const asNumber of asNumbers) {
+    proms.push(doAnalyze(conn, asNumber, preferredCountries));
+  }
+  await Promise.all(proms);
+  conn.closeSync();
 }
 
 function getURL(asNumber) {
@@ -32,7 +45,11 @@ function getURL(asNumber) {
 }
 
 function peersFile(asNumber) {
-  return `data/peers-${asNumber}.json`;
+  return `${targetDir}/peers-${asNumber}.json`;
+}
+
+function ispFile() {
+  return `${targetDir}/isp.json`;
 }
 
 const suppressImage = (route) => {
@@ -69,63 +86,91 @@ async function getPeers(page, asNumber) {
     peers.push({ rank: parseInt(rank), name, country, ipv6, peer });
   }
 
-  return { isp, peers };
+  await fs.promises.writeFile(
+    peersFile(asNumber),
+    JSON.stringify(peers, null, 2),
+  );
+
+  return { asNumber, name: isp, timestamp: Date.now() };
 }
 
-async function getPeer(tr) {
-  return await tr.evaluate((el) => {
-    const rank = el.querySelector("td:nth-child(1)").textContent;
-    const name = el.querySelector("td:nth-child(2)").textContent;
-    const country = el.querySelector("td:nth-child(2) img").getAttribute("alt");
-    const ipv6 = el.querySelector("td:nth-child(3)").textContent;
-    const peer = el.querySelector("td:nth-child(4)").textContent;
+async function doAnalyze(conn, asNumber, preferredCountries) {
+  const isp = await ispName(conn, asNumber);
+  const peersCount = await countPeers(conn, asNumber);
+  const countriesCount = await countCountries(conn, asNumber);
+  const preferredCountriesCount = await countPreferredCountries(
+    conn,
+    asNumber,
+    preferredCountries,
+  );
+  const countries = await getCountries(conn, asNumber);
 
-    return { rank: parseInt(rank), name, country, ipv6, peer };
-  });
-}
-
-async function analyze(asNumber) {
-  const connection = await DuckDBConnection.create();
-  const peersCount = await countPeers(asNumber, connection);
-  const countriesCount = await countCountries(asNumber, connection);
-
-  connection.closeSync();
-
+  console.log("");
+  console.log(isp.name, timestampString(isp.timestamp));
   console.log(`==> ${peersCount} peers`);
   console.log(`==> ${countriesCount} countries`);
+  console.log(`==> ${preferredCountriesCount} preferred countries`);
+  console.log(`==> Countries`);
+  for (const c of countries) {
+    console.log(`    ${c.country}: ${c.jml}`);
+  }
 }
 
-async function countPeers(asNumber, conn) {
+const timestampString = (timestamp) =>
+  new Date(parseInt(timestamp)).toLocaleString("id-ID");
+
+async function ispName(conn, asNumber) {
+  const query = `SELECT name, timestamp FROM read_json('${ispFile()}') WHERE asNumber = ${asNumber}`;
+  const result = await conn.runAndReadAll(query);
+  const rowObjects = result.getRowObjectsJson();
+  return rowObjects[0];
+}
+
+async function countPeers(conn, asNumber) {
   const query = `SELECT COUNT(*) AS jml FROM read_json('${peersFile(asNumber)}')`;
   const result = await conn.runAndReadAll(query);
   const rowObjects = result.getRowObjectsJson();
   return rowObjects[0].jml;
 }
 
-async function countCountries(asNumber, conn) {
+async function countCountries(conn, asNumber) {
   const query = `SELECT COUNT(DISTINCT country) AS jml FROM read_json('${peersFile(asNumber)}')`;
   const result = await conn.runAndReadAll(query);
   const rowObjects = result.getRowObjectsJson();
   return rowObjects[0].jml;
 }
 
-// Telkom
-await main(7713);
+async function countPreferredCountries(conn, asNumber, preferredCountries) {
+  const query = `SELECT COUNT(DISTINCT country) AS jml FROM read_json('${peersFile(asNumber)}') WHERE country IN (${preferredCountries.map((country) => `'${country}'`).join(", ")})`;
+  const result = await conn.runAndReadAll(query);
+  const rowObjects = result.getRowObjectsJson();
+  return rowObjects[0].jml;
+}
 
-// Indosat
-await main(4761);
+async function getCountries(conn, asNumber) {
+  const query = `SELECT country, COUNT(*) AS jml FROM read_json('${peersFile(asNumber)}') GROUP BY country ORDER BY jml DESC`;
+  const result = await conn.runAndReadAll(query);
+  const rowObjects = result.getRowObjectsJson();
+  return rowObjects;
+}
 
-// SIMS
-await main(23671);
+const asNumbers = [
+  7713, // Telkom
+  4761, // Indosat
+  23671, // SIMS
+];
 
-/*
-tailand
-ceko
-nigeria
-etiopia
-sudan
-tajikistan
-pakistan
-timor leste
-malaysia
-*/
+const preferredCountries = [
+  "Pakistan",
+  "Thailand",
+  "Czech Republic",
+  "Nigeria",
+  "Timor-Leste",
+  "Malaysia",
+  "Tajikistan",
+  "Ethiopia",
+  "Sudan",
+];
+
+// await fetchPeers(asNumbers);
+await analyze(asNumbers, preferredCountries);
